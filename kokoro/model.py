@@ -106,3 +106,44 @@ class KModel(torch.nn.Module):
         asr = t_en @ pred_aln_trg
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze().cpu()
         return self.Output(audio=audio, pred_dur=pred_dur.cpu()) if return_output else audio
+
+    @torch.no_grad()
+    def stream_forward(self, input_ids: list, ref_s: torch.Tensor, speed: float, prev_states: dict):
+        """Streaming-friendly forward pass with state retention"""
+        # Convert input IDs to tensor
+        input_tensor = torch.LongTensor([input_ids]).to(self.device)
+        
+        # Modified processing with state retention
+        bert_dur = self.bert(input_tensor, attention_mask=None, past_key_values=prev_states.get('bert_states'))
+        d_en = self.bert_encoder(bert_dur.last_hidden_state).transpose(-1, -2)
+        
+        # Update prosody prediction with streaming constraints
+        s = ref_s[:, 128:]
+        d = self.predictor.text_encoder(d_en, s, None, None)
+        
+        # Use retained LSTM states
+        lstm_hidden = prev_states.get('lstm_hidden')
+        lstm_cell = prev_states.get('lstm_cell')
+        x, (new_hidden, new_cell) = self.predictor.lstm(d, (lstm_hidden, lstm_cell))
+        
+        # Store states for next iteration
+        self._current_states = {
+            'bert_states': bert_dur.past_key_values,
+            'lstm_hidden': new_hidden,
+            'lstm_cell': new_cell,
+            'prev_audio': audio_chunk[-4800:] if audio_chunk is not None else None
+        }
+        
+        # Modified decoder for chunk-wise processing
+        audio_chunk = self.decoder.stream_forward(
+            asr=d_en,
+            F0_curve=self.predictor.F0_proj(x),
+            N=self.predictor.N_proj(x),
+            s=ref_s[:, :128],
+            prev_audio=prev_states.get('prev_audio')
+        )
+        
+        return audio_chunk.squeeze()
+
+    def get_current_states(self):
+        return self._current_states
