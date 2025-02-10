@@ -488,7 +488,7 @@ class StreamKPipeline:
         text: Union[str, List[str]],
         voice: Optional[str] = None,
         speed: Number = 1,
-        split_pattern: Optional[str] = r'([.!?…])\s+' # Split at sentence ends for better streaming
+        split_pattern: Optional[str] = r'([.!?…])\s+', # Split at sentence ends for better streaming
         model: Optional[KModel] = None
     ) -> Generator['StreamKPipeline.StreamResult', None, None]:
         """Generates audio in a streaming fashion.
