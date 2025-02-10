@@ -1,184 +1,108 @@
-# https://github.com/yl4579/StyleTTS2/blob/main/models.py
-from .istftnet import AdainResBlk1d
-from torch.nn.utils import weight_norm
-from transformers import AlbertModel
-import numpy as np
+from .istftnet import Decoder
+from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
+from dataclasses import dataclass
+from huggingface_hub import hf_hub_download
+from loguru import logger
+from numbers import Number
+from transformers import AlbertConfig
+from typing import Dict, Optional, Union
+import json
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
+class KModel(torch.nn.Module):
+    '''
+    KModel is a torch.nn.Module with 2 main responsibilities:
+    1. Init weights, downloading config.json + model.pth from HF if needed
+    2. forward(phonemes: str, ref_s: FloatTensor) -> (audio: FloatTensor)
 
-class LinearNorm(nn.Module):
-    def __init__(self, in_dim, out_dim, bias=True, w_init_gain='linear'):
-        super(LinearNorm, self).__init__()
-        self.linear_layer = nn.Linear(in_dim, out_dim, bias=bias)
-        nn.init.xavier_uniform_(self.linear_layer.weight, gain=nn.init.calculate_gain(w_init_gain))
+    You likely only need one KModel instance, and it can be reused across
+    multiple KPipelines to avoid redundant memory allocation.
 
-    def forward(self, x):
-        return self.linear_layer(x)
+    Unlike KPipeline, KModel is language-blind.
 
+    KModel stores self.vocab and thus knows how to map phonemes -> input_ids,
+    so there is no need to repeatedly download config.json outside of KModel.
+    '''
 
-class LayerNorm(nn.Module):
-    def __init__(self, channels, eps=1e-5):
+    REPO_ID = 'hexgrad/Kokoro-82M'
+
+    def __init__(self, config: Union[Dict, str, None] = None, model: Optional[str] = None):
         super().__init__()
-        self.channels = channels
-        self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(channels))
-        self.beta = nn.Parameter(torch.zeros(channels))
+        if not isinstance(config, dict):
+            if not config:
+                logger.debug("No config provided, downloading from HF")
+                config = hf_hub_download(repo_id=KModel.REPO_ID, filename='config.json')
+            with open(config, 'r', encoding='utf-8') as r:
+                config = json.load(r)
+                logger.debug(f"Loaded config: {config}")
+        self.vocab = config['vocab']
+        self.bert = CustomAlbert(AlbertConfig(vocab_size=config['n_token'], **config['plbert']))
+        self.bert_encoder = torch.nn.Linear(self.bert.config.hidden_size, config['hidden_dim'])
+        self.context_length = self.bert.config.max_position_embeddings
+        self.predictor = ProsodyPredictor(
+            style_dim=config['style_dim'], d_hid=config['hidden_dim'],
+            nlayers=config['n_layer'], max_dur=config['max_dur'], dropout=config['dropout']
+        )
+        self.text_encoder = TextEncoder(
+            channels=config['hidden_dim'], kernel_size=config['text_encoder_kernel_size'],
+            depth=config['n_layer'], n_symbols=config['n_token']
+        )
+        self.decoder = Decoder(
+            dim_in=config['hidden_dim'], style_dim=config['style_dim'],
+            dim_out=config['n_mels'], **config['istftnet']
+        )
+        if not model:
+            model = hf_hub_download(repo_id=KModel.REPO_ID, filename='kokoro-v1_0.pth')
+        for key, state_dict in torch.load(model, map_location='cpu', weights_only=True).items():
+            assert hasattr(self, key), key
+            try:
+                getattr(self, key).load_state_dict(state_dict)
+            except:
+                logger.debug(f"Did not load {key} from state_dict")
+                state_dict = {k[7:]: v for k, v in state_dict.items()}
+                getattr(self, key).load_state_dict(state_dict, strict=False)
 
-    def forward(self, x):
-        x = x.transpose(1, -1)
-        x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
-        return x.transpose(1, -1)
+    @property
+    def device(self):
+        return self.bert.device
 
+    @dataclass
+    class Output:
+        audio: torch.FloatTensor
+        pred_dur: Optional[torch.LongTensor] = None
 
-class TextEncoder(nn.Module):
-    def __init__(self, channels, kernel_size, depth, n_symbols, actv=nn.LeakyReLU(0.2)):
-        super().__init__()
-        self.embedding = nn.Embedding(n_symbols, channels)
-        padding = (kernel_size - 1) // 2
-        self.cnn = nn.ModuleList()
-        for _ in range(depth):
-            self.cnn.append(nn.Sequential(
-                weight_norm(nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)),
-                LayerNorm(channels),
-                actv,
-                nn.Dropout(0.2),
-            ))
-        self.lstm = nn.LSTM(channels, channels//2, 1, batch_first=True, bidirectional=True)
-
-    def forward(self, x, input_lengths, m):
-        x = self.embedding(x)  # [B, T, emb]
-        x = x.transpose(1, 2)  # [B, emb, T]
-        m = m.to(input_lengths.device).unsqueeze(1)
-        x.masked_fill_(m, 0.0)
-        for c in self.cnn:
-            x = c(x)
-            x.masked_fill_(m, 0.0)
-        x = x.transpose(1, 2)  # [B, T, chn]
-        input_lengths = input_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(x, input_lengths, batch_first=True, enforce_sorted=False)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x = x.transpose(-1, -2)
-        x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]])
-        x_pad[:, :, :x.shape[-1]] = x
-        x = x_pad.to(x.device)
-        x.masked_fill_(m, 0.0)
-        return x
-
-
-class AdaLayerNorm(nn.Module):
-    def __init__(self, style_dim, channels, eps=1e-5):
-        super().__init__()
-        self.channels = channels
-        self.eps = eps
-        self.fc = nn.Linear(style_dim, channels*2)
-
-    def forward(self, x, s):
-        x = x.transpose(-1, -2)
-        x = x.transpose(1, -1)
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        gamma, beta = gamma.transpose(1, -1), beta.transpose(1, -1)
-        x = F.layer_norm(x, (self.channels,), eps=self.eps)
-        x = (1 + gamma) * x + beta
-        return x.transpose(1, -1).transpose(-1, -2)
-
-
-class ProsodyPredictor(nn.Module):
-    def __init__(self, style_dim, d_hid, nlayers, max_dur=50, dropout=0.1):
-        super().__init__()
-        self.text_encoder = DurationEncoder(sty_dim=style_dim, d_model=d_hid,nlayers=nlayers, dropout=dropout)
-        self.lstm = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
-        self.duration_proj = LinearNorm(d_hid, max_dur)
-        self.shared = nn.LSTM(d_hid + style_dim, d_hid // 2, 1, batch_first=True, bidirectional=True)
-        self.F0 = nn.ModuleList()
-        self.F0.append(AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout))
-        self.F0.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout))
-        self.F0.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout))
-        self.N = nn.ModuleList()
-        self.N.append(AdainResBlk1d(d_hid, d_hid, style_dim, dropout_p=dropout))
-        self.N.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim, upsample=True, dropout_p=dropout))
-        self.N.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim, dropout_p=dropout))
-        self.F0_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
-        self.N_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
-
-    def forward(self, texts, style, text_lengths, alignment, m):
-        d = self.text_encoder(texts, style, text_lengths, m)
-        batch_size = d.shape[0]
-        text_size = d.shape[1]
-        input_lengths = text_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(d, input_lengths, batch_first=True, enforce_sorted=False)
-        m = m.to(text_lengths.device).unsqueeze(1)
-        self.lstm.flatten_parameters()
-        x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x_pad = torch.zeros([x.shape[0], m.shape[-1], x.shape[-1]])
-        x_pad[:, :x.shape[1], :] = x
-        x = x_pad.to(x.device)
-        duration = self.duration_proj(nn.functional.dropout(x, 0.5, training=False))
-        en = (d.transpose(-1, -2) @ alignment)
-        return duration.squeeze(-1), en
-
-    def F0Ntrain(self, x, s):
-        x, _ = self.shared(x.transpose(-1, -2))
-        F0 = x.transpose(-1, -2)
-        for block in self.F0:
-            F0 = block(F0, s)
-        F0 = self.F0_proj(F0)
-        N = x.transpose(-1, -2)
-        for block in self.N:
-            N = block(N, s)
-        N = self.N_proj(N)
-        return F0.squeeze(1), N.squeeze(1)
-
-
-class DurationEncoder(nn.Module):
-    def __init__(self, sty_dim, d_model, nlayers, dropout=0.1):
-        super().__init__()
-        self.lstms = nn.ModuleList()
-        for _ in range(nlayers):
-            self.lstms.append(nn.LSTM(d_model + sty_dim, d_model // 2, num_layers=1, batch_first=True, bidirectional=True, dropout=dropout))
-            self.lstms.append(AdaLayerNorm(sty_dim, d_model))
-        self.dropout = dropout
-        self.d_model = d_model
-        self.sty_dim = sty_dim
-
-    def forward(self, x, style, text_lengths, m):
-        masks = m.to(text_lengths.device)
-        x = x.permute(2, 0, 1)
-        s = style.expand(x.shape[0], x.shape[1], -1)
-        x = torch.cat([x, s], axis=-1)
-        x.masked_fill_(masks.unsqueeze(-1).transpose(0, 1), 0.0)
-        x = x.transpose(0, 1)
-        input_lengths = text_lengths.cpu().numpy()
-        x = x.transpose(-1, -2)
-        for block in self.lstms:
-            if isinstance(block, AdaLayerNorm):
-                x = block(x.transpose(-1, -2), style).transpose(-1, -2)
-                x = torch.cat([x, s.permute(1, -1, 0)], axis=1)
-                x.masked_fill_(masks.unsqueeze(-1).transpose(-1, -2), 0.0)
-            else:
-                x = x.transpose(-1, -2)
-                x = nn.utils.rnn.pack_padded_sequence(
-                    x, input_lengths, batch_first=True, enforce_sorted=False)
-                block.flatten_parameters()
-                x, _ = block(x)
-                x, _ = nn.utils.rnn.pad_packed_sequence(
-                    x, batch_first=True)
-                x = F.dropout(x, p=self.dropout, training=False)
-                x = x.transpose(-1, -2)
-                x_pad = torch.zeros([x.shape[0], x.shape[1], m.shape[-1]])
-                x_pad[:, :, :x.shape[-1]] = x
-                x = x_pad.to(x.device)
-        return x.transpose(-1, -2)
-
-
-# https://github.com/yl4579/StyleTTS2/blob/main/Utils/PLBERT/util.py
-class CustomAlbert(AlbertModel):
-    def forward(self, *args, **kwargs):
-        outputs = super().forward(*args, **kwargs)
-        return outputs.last_hidden_state
+    @torch.no_grad()
+    def forward(
+        self,
+        phonemes: str,
+        ref_s: torch.FloatTensor,
+        speed: Number = 1,
+        return_output: bool = False # MARK: BACKWARD COMPAT
+    ) -> Union['KModel.Output', torch.FloatTensor]:
+        input_ids = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), phonemes)))
+        logger.debug(f"phonemes: {phonemes} -> input_ids: {input_ids}")
+        assert len(input_ids)+2 <= self.context_length, (len(input_ids)+2, self.context_length)
+        input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device)
+        input_lengths = torch.LongTensor([input_ids.shape[-1]]).to(self.device)
+        text_mask = torch.arange(input_lengths.max()).unsqueeze(0).expand(input_lengths.shape[0], -1).type_as(input_lengths)
+        text_mask = torch.gt(text_mask+1, input_lengths.unsqueeze(1)).to(self.device)
+        bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
+        d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
+        ref_s = ref_s.to(self.device)
+        s = ref_s[:, 128:]
+        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+        x, _ = self.predictor.lstm(d)
+        duration = self.predictor.duration_proj(x)
+        duration = torch.sigmoid(duration).sum(axis=-1) / speed
+        pred_dur = torch.round(duration).clamp(min=1).long().squeeze()
+        logger.debug(f"pred_dur: {pred_dur}")
+        indices = torch.repeat_interleave(torch.arange(input_ids.shape[1], device=self.device), pred_dur)
+        pred_aln_trg = torch.zeros((input_ids.shape[1], indices.shape[0]), device=self.device)
+        pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
+        pred_aln_trg = pred_aln_trg.unsqueeze(0).to(self.device)
+        en = d.transpose(-1, -2) @ pred_aln_trg
+        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
+        t_en = self.text_encoder(input_ids, input_lengths, text_mask)
+        asr = t_en @ pred_aln_trg
+        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze().cpu()
+        return self.Output(audio=audio, pred_dur=pred_dur.cpu()) if return_output else audio
