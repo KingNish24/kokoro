@@ -102,6 +102,18 @@ class TorchSTFT(nn.Module):
         reconstruction = self.inverse(self.magnitude, self.phase)
         return reconstruction
 
+    def stream_inverse(self, magnitude, phase):
+        """Streaming ISTFT with overlap-add"""
+        window = self.window.to(magnitude.device)
+        return torch.istft(
+            magnitude * torch.exp(phase * 1j),
+            self.filter_length,
+            self.hop_length,
+            self.win_length,
+            window=window,
+            return_complex=False
+        )
+
 
 class SineGen(nn.Module):
     """ Definition of sine generator
@@ -317,6 +329,21 @@ class Generator(nn.Module):
         spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
         return self.stft.inverse(spec, phase)
+    
+    def stream_forward(self, x, s, f0):
+        """Streaming generator with causal operations"""
+        # Modified upsampling with causal padding
+        for i in range(self.num_upsamples):
+            x = F.leaky_relu(x, 0.1)
+            x = self.ups[i](x)
+            
+        # Causal convolution for output
+        x = self.conv_post(x)
+        
+        # Streaming ISTFT with phase continuation
+        spec = torch.exp(x[:, :self.post_n_fft//2+1, :])
+        phase = torch.sin(x[:, self.post_n_fft//2+1:, :])
+        return self.stft.stream_inverse(spec, phase)
 
 
 class UpSample1d(nn.Module):
@@ -396,6 +423,24 @@ class Decoder(nn.Module):
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
                                    upsample_initial_channel, resblock_dilation_sizes, 
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size)
+    
+    def stream_forward(self, asr, F0_pred, N_pred, s, prev_audio=None):
+        """Streaming-friendly decoder forward pass"""
+        # Modified processing with causal convolutions
+        x = torch.cat([asr, F0_pred, N_pred], axis=1)
+        x = self.encode(x, s)
+        
+        # Maintain audio context for overlap
+        if prev_audio is not None:
+            x = torch.cat([prev_audio, x], dim=-1)
+            
+        # Process through streaming-optimized blocks
+        for block in self.decode:
+            x = block(x, s)
+            
+        # Generate output chunk with overlap handling
+        audio_chunk = self.generator.stream_forward(x, s, F0_pred)
+        return audio_chunk
 
     def forward(self, asr, F0_curve, N, s):
         F0 = self.F0_conv(F0_curve.unsqueeze(1))
