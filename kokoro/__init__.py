@@ -20,4 +20,4 @@ logger.add(
 logger.disable("kokoro")
 
 from .model import KModel
-from .pipeline import KPipeline, StreamKPipeline
+from .pipeline import AutoregressiveStreamKPipeline
