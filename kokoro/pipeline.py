@@ -7,6 +7,7 @@ from numbers import Number
 from typing import Generator, List, Optional, Tuple, Union
 import re
 import torch
+import time
 
 ALIASES = {
     'en-us': 'a',
@@ -377,183 +378,67 @@ class KPipeline:
                 yield self.Result(graphemes=graphemes, phonemes=ps, output=output)
 
 class StreamKPipeline:
-    '''
-    StreamKPipeline is a true streaming language-aware support class.
-    It aims to generate audio outputs as soon as possible, without waiting
-    for the entire input text.
-
-    Limitations: True phoneme-by-phoneme streaming with StyleTTS2 architecture
-    is complex due to the model's design (BERT, LSTM). This implementation
-    approximates streaming by processing text in small segments (e.g., sentence
-    or phrase level) and yielding audio chunks as they are generated. For true
-    sample-level streaming, significant model architecture changes would be needed.
-    '''
-    def __init__(
-        self,
-        lang_code: str,
-        model: Union[KModel, bool] = True,
-        trf: bool = False,
-        device: Optional[str] = None,
-        segment_length: int = 150 # Target phoneme segment length for streaming
-    ):
+    def __init__(self, lang_code: str, model: KModel, voice: str, speed: Number = 1, device: str = None, sr: int = 24000):
         """Initialize a StreamKPipeline.
 
         Args:
-            lang_code: Language code for G2P processing
-            model: KModel instance, True to create new model, False for no model
-            trf: Whether to use transformer-based G2P
-            device: Override default device selection ('cuda' or 'cpu', or None for auto)
-                   If None, will auto-select cuda if available
-                   If 'cuda' and not available, will explicitly raise an error
-            segment_length: Target length (in phonemes) of each streaming segment.
+            lang_code: Language code for G2P processing.
+            model: Pre-loaded KModel instance.
+            voice: Voice to use for synthesis. Pre-loaded in the model.
+            speed: Speech speed modifier (default: 1).
+            device: Device to run on ('cuda' or 'cpu').
+            sr: sampling rate
         """
-        lang_code = lang_code.lower()
-        lang_code = ALIASES.get(lang_code, lang_code)
-        assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
-        self.lang_code = lang_code
-        self.model = None
-        if isinstance(model, KModel):
-            self.model = model
-        elif model:
-            if device == 'cuda' and not torch.cuda.is_available():
-                raise RuntimeError("CUDA requested but not available")
-            if device is None:
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            try:
-                self.model = KModel().to(device).eval()
-            except RuntimeError as e:
-                if device == 'cuda':
-                    raise RuntimeError(f"""Failed to initialize model on CUDA: {e}.
-                                       Try setting device='cpu' or check CUDA installation.""")
-                raise
-        self.voices = {}
-        self.segment_length = segment_length # Target phoneme segment length
-        if lang_code in 'ab':
-            try:
-                fallback = espeak.EspeakFallback(british=lang_code=='b')
-            except Exception as e:
-                logger.warning("EspeakFallback not Enabled: OOD words will be skipped")
-                logger.warning({str(e)})
-                fallback = None
-            self.g2p = en.G2P(trf=trf, british=lang_code=='b', fallback=fallback, unk='')
-        elif lang_code == 'j':
-            try:
-                from misaki import ja
-                self.g2p = ja.JAG2P()
-            except ImportError:
-                logger.error("You need to `pip install misaki[ja]` to use lang_code='j'")
-                raise
-        elif lang_code == 'z':
-            try:
-                from misaki import zh
-                self.g2p = zh.ZHG2P()
-            except ImportError:
-                logger.error("You need to `pip install misaki[zh]` to use lang_code='z'")
-                raise
-        else:
-            language = LANG_CODES[lang_code]
-            logger.warning(f"Using EspeakG2P(language='{language}'). Streaming chunking logic not yet fully optimized.")
-            self.g2p = espeak.EspeakG2P(language=language)
 
-    def load_voice(self, voice: str, delimiter: str = ",") -> torch.FloatTensor:
-        if voice in self.voices:
-            return self.voices[voice]
-        logger.debug(f"Loading voice: {voice}")
-        packs = [self.load_single_voice(v) for v in voice.split(delimiter)]
-        if len(packs) == 1:
-            return packs[0]
-        self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
-        return self.voices[voice]
+        self.lang_code = lang_code.lower()  
+        self.lang_code = ALIASES.get(self.lang_code, self.lang_code)
+        assert self.lang_code in LANG_CODES, (self.lang_code, LANG_CODES)
+        self.model = model.to(device) if device else model
+        self.voice = voice
+        self.speed = speed
+        self.device = device
+        self.sr = sr
+        self.ref_s = self.model.load_voice(self.voice).to(self.device) if self.model else None
+        if self.lang_code in 'ab':
+           try:
+               fallback = espeak.EspeakFallback(british=self.lang_code == 'b')
+           except Exception as e:
+               logger.warning("EspeakFallback not Enabled: OOD words will be skipped")
+               logger.warning({str(e)})
+               fallback = None
+        self.g2p = en.G2P(trf=True, british=self.lang_code == 'b', fallback=fallback, unk='')
 
-    def _split_phonemes_into_segments(self, phonemes_str: str, segment_length: int) -> List[str]:
-        """Splits a phoneme string into segments of approximately `segment_length`."""
-        phonemes = phonemes_str.strip().split()
-        segments = []
-        current_segment = []
-        current_length = 0
-        for p in phonemes:
-            if current_length + 1 <= segment_length or not current_segment: # +1 for the phoneme itself
-                current_segment.append(p)
-                current_length += 1
-            else:
-                segments.append(" ".join(current_segment))
-                current_segment = [p]
-                current_length = 1
-        if current_segment:
-            segments.append(" ".join(current_segment))
-        return segments
 
-    def stream_generate(
-        self,
-        text: Union[str, List[str]],
-        voice: Optional[str] = None,
-        speed: Number = 1,
-        split_pattern: Optional[str] = r'([.!?…])\s+', # Split at sentence ends for better streaming
-        model: Optional[KModel] = None
-    ) -> Generator['StreamKPipeline.StreamResult', None, None]:
-        """Generates audio in a streaming fashion.
 
-        Args:
-            text: Text to synthesize.
-            voice: Voice to use.
-            speed: Speech speed modifier.
-            split_pattern: Pattern to split text into segments for streaming.
-            model: Optional KModel instance.
-
-        Yields:
-            StreamKPipeline.StreamResult objects containing audio chunks.
-        """
-        model = model or self.model
-        if model and voice is None:
-            raise ValueError('Specify a voice: stream_pipeline.stream_generate(..., voice="af_heart")')
-        pack = self.load_voice(voice).to(model.device) if model else None
-
-        if isinstance(text, str):
-            text_segments = re.split(split_pattern, text)
-            # Re-join the delimiters to the segments they belong to.
-            # This is a simple way to keep sentence endings with their sentences.
-            processed_segments = []
-            combined_segment = ""
-            for segment in text_segments:
-                combined_segment += segment
-                if re.search(split_pattern, segment): # If the segment ended with a delimiter
-                    processed_segments.append(combined_segment.strip())
-                    combined_segment = ""
-            if combined_segment: # Handle any remaining text
-                processed_segments.append(combined_segment.strip())
-            text = processed_segments
-
-        for graphemes in text:
-            if not graphemes.strip(): # Skip empty segments
+    def stream_infer(self, text: str):
+        phonemes = self.g2p(text)[1] 
+        for phoneme in phonemes:   
+            start_time = time.time()
+            if not phoneme.phonemes:
                 continue
+            output = self.model(phoneme.phonemes, self.ref_s, self.speed)
 
-            if self.lang_code in 'ab':
-                logger.debug(f"Processing English text segment: {graphemes[:50]}{'...' if len(graphemes) > 50 else ''}")
-                _, tokens = self.g2p(graphemes)
-                phonemes_full = KPipeline.tokens_to_ps(tokens) # Get full phoneme sequence for the segment
+            yield output.audio, phoneme # Yield audio and phoneme information instantly
+            processing_time = time.time() - start_time
+            if processing_time< (1/((self.sr/1000) )* len(phoneme.phonemes)*self.speed):
+                time.sleep((1/((self.sr/1000) )* len(phoneme.phonemes)*self.speed) - processing_time)
             else:
-                phonemes_full = self.g2p(graphemes)
+                logger.warning("Model is slower than real time.")
 
-            if not phonemes_full:
-                continue
 
-            phoneme_segments = self._split_phonemes_into_segments(phonemes_full, self.segment_length)
-
-            for ps in phoneme_segments:
-                if not ps.strip():
-                    continue
-                elif len(ps) > 510: # Still limit max input length
-                    logger.warning(f'Truncating long phoneme segment to 510 characters.')
-                    ps = ps[:510]
-
-                output = KPipeline.infer(model, ps, pack, speed) if model else None
-                if output and output.audio is not None:
-                    yield self.StreamResult(audio_chunk=output.audio)
 
     @dataclass
     class StreamResult:
-        audio_chunk: Optional[torch.FloatTensor] = None
+        audio: torch.FloatTensor
+        phoneme: en.MToken
 
 
-    def __call__(self, *args, **kwargs) -> Generator['StreamKPipeline.StreamResult', None, None]:
-        return self.stream_generate(*args, **kwargs)
+    def __call__(self, text: str):
+        """Streams audio for the given text.
+        Args:
+            text: The input text.
+        Yields:
+            StreamResult: audio tensor and phoneme
+        """
+        for audio_chunk, phoneme in self.stream_infer(text):
+            yield self.StreamResult(audio=audio_chunk, phoneme=phoneme)
