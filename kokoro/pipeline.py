@@ -69,7 +69,7 @@ class KPipeline:
         device: Optional[str] = None
     ):
         """Initialize a KPipeline.
-        
+
         Args:
             lang_code: Language code for G2P processing
             model: KModel instance, True to create new model, False for no model
@@ -94,7 +94,7 @@ class KPipeline:
                 self.model = KModel().to(device).eval()
             except RuntimeError as e:
                 if device == 'cuda':
-                    raise RuntimeError(f"""Failed to initialize model on CUDA: {e}. 
+                    raise RuntimeError(f"""Failed to initialize model on CUDA: {e}.
                                        Try setting device='cpu' or check CUDA installation.""")
                 raise
         self.voices = {}
@@ -229,23 +229,23 @@ class KPipeline:
         model: Optional[KModel] = None
     ) -> Generator['KPipeline.Result', None, None]:
         """Generate audio from either raw phonemes or pre-processed tokens.
-        
+
         Args:
             tokens: Either a phoneme string or list of pre-processed MTokens
             voice: The voice to use for synthesis
             speed: Speech speed modifier (default: 1)
             model: Optional KModel instance (uses pipeline's model if not provided)
-        
+
         Yields:
             KPipeline.Result containing the input tokens and generated audio
-            
+
         Raises:
             ValueError: If no voice is provided or token sequence exceeds model limits
         """
         model = model or self.model
         if model and voice is None:
             raise ValueError('Specify a voice: pipeline.generate_from_tokens(..., voice="af_heart")')
-        
+
         pack = self.load_voice(voice).to(model.device) if model else None
 
         # Handle raw phoneme string
@@ -256,7 +256,7 @@ class KPipeline:
             output = KPipeline.infer(model, tokens, pack, speed) if model else None
             yield self.Result(graphemes='', phonemes=tokens, output=output)
             return
-        
+
         logger.debug("Processing MTokens")
         # Handle pre-processed tokens
         for gs, ps, tks in self.en_tokenize(tokens):
@@ -375,3 +375,196 @@ class KPipeline:
                     ps = ps[:510]
                 output = KPipeline.infer(model, ps, pack, speed) if model else None
                 yield self.Result(graphemes=graphemes, phonemes=ps, output=output)
+
+
+class StreamKPipeline:
+    '''
+    StreamKPipeline is a streaming language-aware support class for efficient and fast TTS.
+    It processes text in chunks and yields audio chunks in a streaming manner.
+    '''
+    def __init__(
+        self,
+        lang_code: str,
+        model: Union[KModel, bool] = True,
+        trf: bool = False,
+        device: Optional[str] = None,
+        chunk_size: int = 128 # Adjust chunk size for streaming efficiency vs. latency
+    ):
+        """Initialize a StreamKPipeline.
+
+        Args:
+            lang_code: Language code for G2P processing
+            model: KModel instance, True to create new model, False for no model
+            trf: Whether to use transformer-based G2P
+            device: Override default device selection ('cuda' or 'cpu', or None for auto)
+            chunk_size: Size of phoneme chunks processed in each step (adjust for latency/efficiency)
+        """
+        lang_code = lang_code.lower()
+        lang_code = ALIASES.get(lang_code, lang_code)
+        assert lang_code in LANG_CODES, (lang_code, LANG_CODES)
+        self.lang_code = lang_code
+        self.model = None
+        if isinstance(model, KModel):
+            self.model = model
+        elif model:
+            if device == 'cuda' and not torch.cuda.is_available():
+                raise RuntimeError("CUDA requested but not available")
+            if device is None:
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            try:
+                self.model = KModel().to(device).eval()
+            except RuntimeError as e:
+                if device == 'cuda':
+                    raise RuntimeError(f"""Failed to initialize model on CUDA: {e}.
+                                       Try setting device='cpu' or check CUDA installation.""")
+                raise
+        self.voices = {}
+        self.chunk_size = chunk_size # Phoneme chunk size for streaming
+        self.phoneme_buffer = "" # Buffer to hold unprocessed phonemes for context (if needed for more advanced streaming)
+
+        if lang_code in 'ab':
+            try:
+                fallback = espeak.EspeakFallback(british=lang_code=='b')
+            except Exception as e:
+                logger.warning("EspeakFallback not Enabled: OOD words will be skipped")
+                logger.warning({str(e)})
+                fallback = None
+            self.g2p = en.G2P(trf=trf, british=lang_code=='b', fallback=fallback, unk='')
+        elif lang_code == 'j':
+            try:
+                from misaki import ja
+                self.g2p = ja.JAG2P()
+            except ImportError:
+                logger.error("You need to `pip install misaki[ja]` to use lang_code='j'")
+                raise
+        elif lang_code == 'z':
+            try:
+                from misaki import zh
+                self.g2p = zh.ZHG2P()
+            except ImportError:
+                logger.error("You need to `pip install misaki[zh]` to use lang_code='z'")
+                raise
+        else:
+            language = LANG_CODES[lang_code]
+            logger.warning(f"Using EspeakG2P(language='{language}'). Streaming chunking logic not fully optimized.")
+            self.g2p = espeak.EspeakG2P(language=language)
+
+
+    def load_voice(self, voice: str, delimiter: str = ",") -> torch.FloatTensor:
+        if voice in self.voices:
+            return self.voices[voice]
+        logger.debug(f"Loading voice: {voice}")
+        packs = [self.load_single_voice(v) for v in voice.split(delimiter)]
+        if len(packs) == 1:
+            return packs[0]
+        self.voices[voice] = torch.mean(torch.stack(packs), dim=0)
+        return self.voices[voice]
+
+    def load_single_voice(self, voice: str):
+        if voice in self.voices:
+            return self.voices[voice]
+        if voice.endswith('.pt'):
+            f = voice
+        else:
+            f = hf_hub_download(repo_id=KModel.REPO_ID, filename=f'voices/{voice}.pt')
+            if not voice.startswith(self.lang_code):
+                v = LANG_CODES.get(voice, voice)
+                p = LANG_CODES.get(self.lang_code, self.lang_code)
+                logger.warning(f'Language mismatch, loading {v} voice into {p} pipeline.')
+        pack = torch.load(f, weights_only=True)
+        self.voices[voice] = pack
+        return pack
+
+
+    def stream_g2p(self, text_chunk: str) -> str:
+        """Performs G2P on a text chunk and returns phonemes."""
+        if self.lang_code in 'ab':
+            _, tokens = self.g2p(text_chunk)
+            phonemes = KPipeline.tokens_to_ps(tokens) # Reuse KPipeline's token to phoneme conversion
+        else:
+            phonemes = self.g2p(text_chunk)
+        return phonemes
+
+    @classmethod
+    def stream_infer(
+        cls,
+        model: KModel,
+        ps_chunk: str,
+        pack: torch.FloatTensor,
+        speed: Number = 1
+    ) -> KModel.Output:
+        """Inference for a phoneme chunk."""
+        if not ps_chunk.strip(): # Skip empty chunks
+            return KModel.Output(audio=torch.empty(0)) # Return empty audio tensor
+        return model(ps_chunk, pack[len(ps_chunk.strip())-1], speed, return_output=True) # Adjust pack index if needed for streaming context
+
+
+    def __call__(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        speed: Number = 1,
+        split_pattern: Optional[str] = r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s' # Split at sentences
+        # split_pattern: Optional[str] = r'\n+' # Alternative split by newlines
+    ) -> Generator[torch.FloatTensor, None, None]:
+        """
+        Streams audio chunks from input text.
+
+        Args:
+            text: Input text to synthesize.
+            voice: Voice to use for synthesis.
+            speed: Speech speed modifier.
+            split_pattern: Pattern to split text into chunks (sentences by default).
+
+        Yields:
+            torch.FloatTensor: Audio chunks.
+        """
+        model = self.model
+        if model and voice is None:
+            raise ValueError('Specify a voice: stream_pipeline(text="...", voice="af_heart")')
+        pack = self.load_voice(voice).to(model.device) if model else None
+
+        text_chunks = re.split(split_pattern, text.strip()) if split_pattern else [text]
+
+        for text_chunk in text_chunks:
+            if not text_chunk.strip(): # Skip empty text chunks
+                continue
+
+            phoneme_chunk = self.stream_g2p(text_chunk)
+            phoneme_segments = [phoneme_chunk[i:i+self.chunk_size] for i in range(0, len(phoneme_chunk), self.chunk_size)]
+
+            for ps_segment in phoneme_segments:
+                if not ps_segment.strip(): # Skip empty phoneme segments
+                    continue
+                output = StreamKPipeline.stream_infer(model, ps_segment, pack, speed) if model else None
+                if output and output.audio is not None and output.audio.numel() > 0: # Check if audio is valid
+                    yield output.audio
+
+
+    @dataclass
+    class Result: # Keep Result class for potential future use or consistency
+        graphemes: str
+        phonemes: str
+        tokens: Optional[List[en.MToken]] = None
+        output: Optional[KModel.Output] = None
+
+        @property
+        def audio(self) -> Optional[torch.FloatTensor]:
+            return None if self.output is None else self.output.audio
+
+        @property
+        def pred_dur(self) -> Optional[torch.LongTensor]:
+            return None if self.output is None else self.output.pred_dur
+
+        ### MARK: BEGIN BACKWARD COMPAT ###
+        def __iter__(self):
+            yield self.graphemes
+            yield self.phonemes
+            yield self.audio
+
+        def __getitem__(self, index):
+            return [self.graphemes, self.phonemes, self.audio][index]
+
+        def __len__(self):
+            return 3
+        #### MARK: END BACKWARD COMPAT ####
